@@ -5,25 +5,45 @@ Uses OpenAI Realtime API (gpt-realtime) over WebSocket for speech-to-speech
 interaction.  Simulates authentication and bill-pay for a fictitious
 electric utility ("PowerGrid Electric").
 
+Echo handling (--echo flag):
+    aec   — Acoustic echo cancellation via pyaec.  Mic stays open so the
+             user can interrupt mid-sentence.  Best with speakers.  (default)
+    gate  — Mute the mic while the assistant is speaking.  Simple, but
+             blocks interruption.  Works without extra dependencies.
+    off   — No echo handling.  Use when the transport already provides it
+             (telephony / PBX, WebRTC, browser-based clients).
+
 Requirements:
     pip install websocket-client pyaudio numpy
+    pip install pyaec          # optional, for --echo aec (recommended)
 
 Usage:
     export OPENAI_API_KEY="sk-..."
-    python utility_voice_assistant.py
+    python utility_voice_assistant.py                # AEC (default)
+    python utility_voice_assistant.py --echo gate    # mic-gating
+    python utility_voice_assistant.py --echo off     # telephony / WebRTC
 """
 
+import argparse
 import os
 import sys
 import json
 import base64
+import struct
 import threading
 import queue
 import time
 from datetime import date
 
+import numpy as np
 import pyaudio
 import websocket
+
+try:
+    from pyaec import Aec as PyAec
+    HAS_PYAEC = True
+except ImportError:
+    HAS_PYAEC = False
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
@@ -37,7 +57,17 @@ WS_HEADERS = [
 SAMPLE_RATE = 24_000          # API expects 24 kHz
 CHANNELS = 1
 FRAME_DURATION_MS = 100       # send audio every 100 ms
-FRAMES_PER_BUFFER = SAMPLE_RATE * FRAME_DURATION_MS // 1000
+FRAMES_PER_BUFFER = SAMPLE_RATE * FRAME_DURATION_MS // 1000  # 2400 samples
+
+# Echo-mode setting (set via CLI)
+ECHO_MODE = "aec"              # "aec" | "gate" | "off"
+
+# AEC parameters (only used when ECHO_MODE == "aec")
+AEC_FILTER_LENGTH = 4800      # 200 ms tail — covers room reverb
+ENERGY_GATE_THRESHOLD = 150   # RMS threshold after AEC to consider "real speech"
+POST_AEC_HOLD_MS = 200        # short hold after last playback chunk to let AEC tail settle
+
+# Gate parameters (only used when ECHO_MODE == "gate")
 ASSISTANT_AUDIO_HOLD_SECONDS = 1.5
 
 # ── Fake customer database (POC) ────────────────────────────────────────────
@@ -232,9 +262,88 @@ Available test accounts for this POC demo:
 - Account 67890 (PIN 1234)
 """
 
-# ── Audio I/O ────────────────────────────────────────────────────────────────
+# ── Audio I/O ───────────────────────────────────────────────────────────────
 
-audio_playback_queue: queue.Queue[bytes] = queue.Queue()
+audio_playback_queue: queue.Queue[bytes | None] = queue.Queue()
+
+# -- AEC reference buffer (shared between playback and mic threads) ----------
+
+_ref_lock = threading.Lock()
+_ref_buffer = bytearray()
+_playback_active = False
+_last_playback_time = 0.0
+
+
+def _push_ref(pcm: bytes):
+    """Record what the speaker is playing so AEC can subtract it."""
+    global _playback_active, _last_playback_time
+    with _ref_lock:
+        _ref_buffer.extend(pcm)
+        max_bytes = SAMPLE_RATE * 2  # keep at most 1 s
+        if len(_ref_buffer) > max_bytes:
+            del _ref_buffer[:len(_ref_buffer) - max_bytes]
+        _playback_active = True
+        _last_playback_time = time.monotonic()
+
+
+def _pop_ref(n_bytes: int) -> bytes:
+    """Pop reference audio aligned to the current mic frame."""
+    with _ref_lock:
+        available = min(n_bytes, len(_ref_buffer))
+        if available == 0:
+            return b'\x00' * n_bytes
+        chunk = bytes(_ref_buffer[:available])
+        del _ref_buffer[:available]
+        if available < n_bytes:
+            chunk += b'\x00' * (n_bytes - available)
+        return chunk
+
+
+def _is_playback_active() -> bool:
+    with _ref_lock:
+        if _playback_active:
+            return True
+        return (time.monotonic() - _last_playback_time) < (POST_AEC_HOLD_MS / 1000.0)
+
+
+def _mark_playback_idle():
+    global _playback_active
+    with _ref_lock:
+        _playback_active = False
+
+
+# -- Gate state (used by "gate" mode) ----------------------------------------
+
+assistant_audio_hold_until = 0.0
+
+
+def mark_assistant_audio():
+    global assistant_audio_hold_until
+    assistant_audio_hold_until = time.monotonic() + ASSISTANT_AUDIO_HOLD_SECONDS
+
+
+def assistant_audio_active() -> bool:
+    return time.monotonic() < assistant_audio_hold_until
+
+
+# -- Playback queue helpers --------------------------------------------------
+
+def flush_playback_queue():
+    """Drain pending audio from the playback queue (for interruption)."""
+    flushed = 0
+    while True:
+        try:
+            chunk = audio_playback_queue.get_nowait()
+            if chunk is None:
+                audio_playback_queue.put(None)  # preserve poison pill
+                break
+            flushed += 1
+        except queue.Empty:
+            break
+    if flushed:
+        print(f"[echo] Flushed {flushed} queued audio chunks (interruption)")
+    with _ref_lock:
+        _ref_buffer.clear()
 
 
 def playback_worker():
@@ -250,14 +359,62 @@ def playback_worker():
     try:
         while True:
             chunk = audio_playback_queue.get()
-            if chunk is None:  # poison pill
+            if chunk is None:
                 break
-            mark_assistant_audio()   # gate the mic while actually writing to speaker
+            if ECHO_MODE == "aec":
+                _push_ref(chunk)
+            elif ECHO_MODE == "gate":
+                mark_assistant_audio()
             stream.write(chunk)
+        _mark_playback_idle()
     finally:
         stream.stop_stream()
         stream.close()
         pa.terminate()
+
+
+# ── Echo cancellation helpers (AEC mode) ────────────────────────────────────
+
+def _create_echo_canceller():
+    if not HAS_PYAEC:
+        return None
+    try:
+        ec = PyAec(FRAMES_PER_BUFFER, AEC_FILTER_LENGTH, SAMPLE_RATE)
+        print("[echo] pyaec adaptive echo canceller initialized")
+        return ec
+    except Exception as e:
+        print(f"[echo] Failed to create pyaec canceller: {e}")
+        return None
+
+
+def _numpy_echo_cancel(mic_pcm: bytes, ref_pcm: bytes) -> bytes:
+    """Fallback AEC using numpy spectral subtraction."""
+    mic = np.frombuffer(mic_pcm, dtype=np.int16).astype(np.float32)
+    ref = np.frombuffer(ref_pcm, dtype=np.int16).astype(np.float32)
+
+    if np.max(np.abs(ref)) < 10:
+        return mic_pcm  # reference is silence
+
+    n_fft = len(mic)
+    mic_fft = np.fft.rfft(mic, n=n_fft)
+    ref_fft = np.fft.rfft(ref, n=n_fft)
+
+    alpha = 1.5   # oversubtraction
+    beta = 0.02   # spectral floor
+
+    clean_mag = np.maximum(np.abs(mic_fft) - alpha * np.abs(ref_fft),
+                           beta * np.abs(mic_fft))
+    clean_fft = clean_mag * np.exp(1j * np.angle(mic_fft))
+    clean = np.fft.irfft(clean_fft, n=n_fft)
+    clean = np.clip(clean, -32768, 32767).astype(np.int16)
+    return clean.tobytes()
+
+
+def _rms(pcm: bytes) -> float:
+    samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+    if len(samples) == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(samples ** 2)))
 
 
 # ── WebSocket callbacks ─────────────────────────────────────────────────────
@@ -265,18 +422,6 @@ def playback_worker():
 mic_stream = None
 pa_instance = None
 mic_thread_stop = threading.Event()
-assistant_audio_hold_until = 0.0
-
-
-def mark_assistant_audio():
-    """Keep a short hold after each assistant audio chunk to suppress echo."""
-    global assistant_audio_hold_until
-    assistant_audio_hold_until = time.monotonic() + ASSISTANT_AUDIO_HOLD_SECONDS
-
-
-def assistant_audio_active() -> bool:
-    """True while assistant playback is active or just finished."""
-    return time.monotonic() < assistant_audio_hold_until
 
 
 def send_session_update(ws):
@@ -291,7 +436,7 @@ def send_session_update(ws):
             "input_audio_transcription": {
                 "model": "gpt-4o-mini-transcribe",
             },
-            "input_audio_noise_reduction": {"type": "far_field"},  # far_field=laptop; near_field=headphones
+            "input_audio_noise_reduction": {"type": "far_field"},
             "turn_detection": {
                 "type": "server_vad",
                 "threshold": 0.9,
@@ -321,20 +466,53 @@ def start_mic_streaming(ws):
         frames_per_buffer=FRAMES_PER_BUFFER,
     )
 
+    echo_canceller = _create_echo_canceller() if ECHO_MODE == "aec" else None
+
     def _mic_loop():
-        print("[mic] Streaming started — speak now!")
+        mode_labels = {
+            "aec": "echo cancellation active — speak any time",
+            "gate": "mic-gating active — use headphones for best results",
+            "off": "echo handling disabled (upstream provides it)",
+        }
+        print(f"[mic] Streaming started — {mode_labels[ECHO_MODE]}")
+        frame_bytes = FRAMES_PER_BUFFER * 2
         last_clear_sent = 0.0
+
         while not mic_thread_stop.is_set():
             try:
-                pcm_data = mic_stream.read(FRAMES_PER_BUFFER, exception_on_overflow=False)
-                if assistant_audio_active():
-                    # Periodically flush server buffer so echo doesn't accumulate
-                    now = time.monotonic()
-                    if now - last_clear_sent > 0.4:
-                        ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
-                        last_clear_sent = now
-                    continue
-                b64_audio = base64.b64encode(pcm_data).decode("utf-8")
+                mic_pcm = mic_stream.read(FRAMES_PER_BUFFER, exception_on_overflow=False)
+
+                # ── gate mode: mute mic while assistant is speaking ──
+                if ECHO_MODE == "gate":
+                    if assistant_audio_active():
+                        now = time.monotonic()
+                        if now - last_clear_sent > 0.4:
+                            ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+                            last_clear_sent = now
+                        continue
+                    send_pcm = mic_pcm
+
+                # ── aec mode: echo-cancel and energy-gate ──
+                elif ECHO_MODE == "aec":
+                    ref_pcm = _pop_ref(frame_bytes)
+                    if echo_canceller is not None:
+                        try:
+                            clean_samples = echo_canceller.cancel_echo(mic_pcm, ref_pcm)
+                            send_pcm = struct.pack(f'<{len(clean_samples)}h', *clean_samples)
+                        except Exception:
+                            send_pcm = _numpy_echo_cancel(mic_pcm, ref_pcm)
+                    else:
+                        send_pcm = _numpy_echo_cancel(mic_pcm, ref_pcm)
+
+                    if _is_playback_active():
+                        if _rms(send_pcm) < ENERGY_GATE_THRESHOLD:
+                            continue
+
+                # ── off mode: raw passthrough ──
+                else:
+                    send_pcm = mic_pcm
+
+                b64_audio = base64.b64encode(send_pcm).decode("utf-8")
                 ws.send(json.dumps({
                     "type": "input_audio_buffer.append",
                     "audio": b64_audio,
@@ -363,7 +541,6 @@ def handle_function_call(ws, call_id: str, name: str, arguments: str):
 
     print(f"[tool] Result: {json.dumps(result)}")
 
-    # Send function output back
     ws.send(json.dumps({
         "type": "conversation.item.create",
         "item": {
@@ -372,18 +549,14 @@ def handle_function_call(ws, call_id: str, name: str, arguments: str):
             "output": json.dumps(result),
         },
     }))
-    # Ask the model to continue responding
     ws.send(json.dumps({"type": "response.create"}))
 
 
 def on_open(ws):
     print("[ws] Connected to OpenAI Realtime API")
     send_session_update(ws)
-    # Kick off the first greeting
     ws.send(json.dumps({"type": "response.create"}))
-    # Start microphone capture
     start_mic_streaming(ws)
-    # Start playback thread
     threading.Thread(target=playback_worker, daemon=True).start()
 
 
@@ -398,14 +571,12 @@ def on_message(ws, message):
         print("[session] Session updated successfully.")
 
     elif etype == "response.audio.delta":
-        # Incoming speech audio — decode and queue for playback
         audio_b64 = event.get("delta", "")
         if audio_b64:
             pcm = base64.b64decode(audio_b64)
             audio_playback_queue.put(pcm)
 
     elif etype == "conversation.item.input_audio_transcription.completed":
-        # Transcript of what the USER said (via gpt-4o-mini-transcribe)
         transcript = event.get("transcript", "").strip()
         if transcript:
             print(f"\n[you] {transcript}")
@@ -414,23 +585,31 @@ def on_message(ws, message):
         print("\n[stt] Transcription failed for user audio.")
 
     elif etype == "response.audio_transcript.delta":
-        # Real-time transcript of what the assistant is saying
         text = event.get("delta", "")
         if text:
             print(text, end="", flush=True)
 
     elif etype == "response.audio_transcript.done":
-        print()  # newline after complete transcript
+        print()
 
     elif etype == "response.function_call_arguments.done":
-        # The model wants to call a function
         call_id = event.get("call_id", "")
         name = event.get("name", "")
         arguments = event.get("arguments", "{}")
         handle_function_call(ws, call_id, name, arguments)
 
+    elif etype == "input_audio_buffer.speech_started":
+        if ECHO_MODE != "gate":
+            # In AEC/off modes, flush queued audio for snappy interruption
+            print("[echo] User speech detected — interrupting playback")
+            flush_playback_queue()
+            _mark_playback_idle()
+
+    elif etype == "input_audio_buffer.speech_stopped":
+        print("[vad] Speech ended — processing...")
+
     elif etype == "response.done":
-        pass  # response cycle complete
+        _mark_playback_idle()
 
     elif etype == "error":
         err = event.get("error", {})
@@ -443,15 +622,11 @@ def on_message(ws, message):
         "response.content_part.added",
         "response.content_part.done",
         "conversation.item.created",
-        "input_audio_buffer.speech_started",
         "input_audio_buffer.committed",
         "conversation.item.input_audio_transcription.delta",
         "rate_limits.updated",
     ):
-        pass  # expected events, ignore silently
-
-    elif etype == "input_audio_buffer.speech_stopped":
-        print("[vad] Speech ended — processing…")
+        pass
 
     else:
         # Uncomment for debugging:
@@ -477,21 +652,51 @@ def on_close(ws, close_status_code, close_msg):
             pa_instance.terminate()
         except Exception:
             pass
-    audio_playback_queue.put(None)  # stop playback thread
+    audio_playback_queue.put(None)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
+    global ECHO_MODE
+
+    parser = argparse.ArgumentParser(
+        description="PowerGrid Electric Voice Assistant POC",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+echo modes:
+  aec    Acoustic echo cancellation (pyaec). Allows interruption.  (default)
+  gate   Mute mic during playback. Simple but blocks interruption.
+  off    No echo handling. For telephony/PBX/WebRTC integrations.""",
+    )
+    parser.add_argument(
+        "--echo",
+        choices=["aec", "gate", "off"],
+        default="aec",
+        help="Echo handling strategy (default: aec)",
+    )
+    args = parser.parse_args()
+    ECHO_MODE = args.echo
+
     if not OPENAI_API_KEY:
         print("Error: Set the OPENAI_API_KEY environment variable.")
         print("  export OPENAI_API_KEY='sk-...'")
         sys.exit(1)
 
+    echo_labels = {
+        "aec": "pyaec (adaptive filter)" if HAS_PYAEC else "numpy spectral subtraction (fallback)",
+        "gate": "mic-gating (1.5 s hold)",
+        "off": "DISABLED (upstream handles echo)",
+    }
+
     print("=" * 60)
     print("  PowerGrid Electric — Voice Assistant POC")
     print("  Model: gpt-realtime  |  Press Ctrl+C to quit")
-    print("  Tip: Use headphones to avoid echo (speakers can trigger cutoffs)")
+    print(f"  Echo mode: {echo_labels[ECHO_MODE]}")
+    if ECHO_MODE == "aec" and not HAS_PYAEC:
+        print("  Tip: pip install pyaec for better echo cancellation")
+    if ECHO_MODE == "gate":
+        print("  Tip: Use headphones to avoid echo issues")
     print("=" * 60)
     print()
     print("Demo accounts:")
@@ -511,7 +716,7 @@ def main():
     try:
         ws.run_forever()
     except KeyboardInterrupt:
-        print("\n[main] Shutting down…")
+        print("\n[main] Shutting down...")
         mic_thread_stop.set()
         audio_playback_queue.put(None)
         ws.close()
