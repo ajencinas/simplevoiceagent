@@ -24,6 +24,12 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+# Logs / audio artifacts
+*.log
+*.wav
+*.mp3
+*.raw
+
 # Misc
 *.deb
 
