@@ -262,7 +262,6 @@ async def websocket_endpoint(client_ws: WebSocket):
     # Connect to OpenAI Realtime API
     extra_headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "OpenAI-Beta": "realtime=v1",
     }
 
     try:
@@ -271,22 +270,29 @@ async def websocket_endpoint(client_ws: WebSocket):
             await openai_ws.send(json.dumps({
                 "type": "session.update",
                 "session": {
+                    "type": "realtime",
                     "instructions": SYSTEM_INSTRUCTIONS,
                     "tools": TOOLS,
-                    "modalities": ["audio", "text"],
-                    "input_audio_format": "pcm16",
-                    "input_audio_transcription": {"model": "gpt-4o-mini-transcribe"},
-                    "input_audio_noise_reduction": {"type": "far_field"},
-                    "turn_detection": {
-                        "type": "server_vad",
-                        "threshold": 0.9,
-                        "prefix_padding_ms": 300,
-                        "silence_duration_ms": 600,
-                        "create_response": True,
-                        "interrupt_response": True,
+                    "output_modalities": ["audio"],
+                    "audio": {
+                        "input": {
+                            "format": {"type": "audio/pcm", "rate": 24000},
+                            "transcription": {"model": "gpt-4o-mini-transcribe"},
+                            "noise_reduction": {"type": "far_field"},
+                            "turn_detection": {
+                                "type": "server_vad",
+                                "threshold": 0.9,
+                                "prefix_padding_ms": 300,
+                                "silence_duration_ms": 600,
+                                "create_response": True,
+                                "interrupt_response": True,
+                            },
+                        },
+                        "output": {
+                            "format": {"type": "audio/pcm", "rate": 24000},
+                            "voice": "coral",
+                        },
                     },
-                    "output_audio_format": "pcm16",
-                    "voice": "coral",
                 },
             }))
             print("[server] Session config sent to OpenAI")
@@ -352,7 +358,7 @@ async def websocket_endpoint(client_ws: WebSocket):
                         event = json.loads(raw)
                         etype = event.get("type", "")
 
-                        if etype == "response.audio.delta":
+                        if etype == "response.output_audio.delta":
                             audio_b64 = event.get("delta", "")
                             if audio_b64:
                                 await client_ws.send_json({
@@ -370,7 +376,7 @@ async def websocket_endpoint(client_ws: WebSocket):
                                 })
                                 print(f"[server] User said: {transcript}")
 
-                        elif etype == "response.audio_transcript.done":
+                        elif etype == "response.output_audio_transcript.done":
                             transcript = event.get("transcript", "").strip()
                             if transcript:
                                 await client_ws.send_json({
@@ -483,7 +489,6 @@ async def twilio_websocket_endpoint(twilio_ws: WebSocket):
 
     extra_headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "OpenAI-Beta": "realtime=v1",
     }
 
     try:
@@ -492,22 +497,29 @@ async def twilio_websocket_endpoint(twilio_ws: WebSocket):
             await openai_ws.send(json.dumps({
                 "type": "session.update",
                 "session": {
+                    "type": "realtime",
                     "instructions": SYSTEM_INSTRUCTIONS,
                     "tools": TOOLS,
-                    "modalities": ["audio", "text"],
-                    "input_audio_format": "pcm16",
-                    "input_audio_transcription": {"model": "gpt-4o-mini-transcribe"},
-                    "input_audio_noise_reduction": {"type": "near_field"},
-                    "turn_detection": {
-                        "type": "server_vad",
-                        "threshold": 0.5,
-                        "prefix_padding_ms": 300,
-                        "silence_duration_ms": 500,
-                        "create_response": True,
-                        "interrupt_response": True,
+                    "output_modalities": ["audio"],
+                    "audio": {
+                        "input": {
+                            "format": {"type": "audio/pcm", "rate": 24000},
+                            "transcription": {"model": "gpt-4o-mini-transcribe"},
+                            "noise_reduction": {"type": "near_field"},
+                            "turn_detection": {
+                                "type": "server_vad",
+                                "threshold": 0.5,
+                                "prefix_padding_ms": 300,
+                                "silence_duration_ms": 500,
+                                "create_response": True,
+                                "interrupt_response": True,
+                            },
+                        },
+                        "output": {
+                            "format": {"type": "audio/pcm", "rate": 24000},
+                            "voice": "coral",
+                        },
                     },
-                    "output_audio_format": "pcm16",
-                    "voice": "coral",
                 },
             }))
             print("[twilio] Session config sent to OpenAI")
@@ -556,7 +568,7 @@ async def twilio_websocket_endpoint(twilio_ws: WebSocket):
                         event = json.loads(raw)
                         etype = event.get("type", "")
 
-                        if etype == "response.audio.delta":
+                        if etype == "response.output_audio.delta":
                             audio_b64 = event.get("delta", "")
                             if audio_b64 and stream_sid:
                                 # Convert PCM16 24kHz → mulaw 8kHz
@@ -571,7 +583,7 @@ async def twilio_websocket_endpoint(twilio_ws: WebSocket):
                                     },
                                 })
 
-                        elif etype == "response.audio_transcript.done":
+                        elif etype == "response.output_audio_transcript.done":
                             transcript = event.get("transcript", "").strip()
                             if transcript:
                                 print(f"[twilio] Assistant said: {transcript}")
